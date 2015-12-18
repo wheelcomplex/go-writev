@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <sys/uio.h>
 #include <string.h>
+#include <signal.h>
 
 #include <string>
 using namespace std;
@@ -13,7 +14,17 @@ using namespace std;
 #define VIDEO_SIZE 4096
 #define HEADER_SIZE 12
 
-int srs_send(int fd, char** group, bool use_writev, bool write_one_by_one);
+static volatile sig_atomic_t exit_signal = 0;
+
+int srs_send(int fd, char** group, bool use_writev, bool write_one_by_one, char* buf);
+
+void handle_sighup(int signum) 
+{
+    /* in case we registered this handler for multiple signals */ 
+    if (signum == SIGHUP || signum == SIGTERM || signum == SIGINT) {
+        exit_signal = 1;
+    }
+}
 
 int main(int argc, char** argv)
 {
@@ -72,43 +83,63 @@ int main(int argc, char** argv)
         exit(-1);
     }
 
-    while (true) {
+    // prepare big buffer
+    char* buf = new char[NB_VIDEOS_IN_GROUP * (HEADER_SIZE + VIDEO_SIZE)];
+
+    // @remark for test, each video is M bytes.
+    char* video = new char[VIDEO_SIZE];
+    // @remark for test, each video header is M0 bytes.
+    char* header = new char[HEADER_SIZE];
+    // @remark for test, each group contains N (header+video)s.
+    char** group = new char*[2 * NB_VIDEOS_IN_GROUP];
+    for (int i = 0; i < 2 * NB_VIDEOS_IN_GROUP; i+= 2) {
+        group[i] = header;
+        group[i + 1] = video;
+    }
+
+    struct linger linger = { 0 };
+    linger.l_onoff = 1;
+    linger.l_linger = 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_LINGER, (const char *) &linger, sizeof(linger)) == -1) {
+        printf("set SO_LINGER failed.\n");
+        return 1;
+    }
+
+    /* you may also prefer sigaction() instead of signal() */
+    signal(SIGHUP, handle_sighup);
+    signal(SIGTERM, handle_sighup);
+    signal(SIGINT, handle_sighup);
+
+    while (exit_signal == 0) {
         int client = ::accept(fd, NULL, NULL);
         if (client == -1) {
             printf("accept failed.\n");
-            exit(-1);
+            break;
         }
 
         // assume there is a video stream, which contains infinite video packets,
         // server must delivery all video packets to client.
         // for high performance, we send a group of video(to avoid too many syscall),
         // here we send 10 videos as a group.
-        while (true) {
-            // @remark for test, each video is M bytes.
-            char* video = new char[VIDEO_SIZE];
-
-            // @remark for test, each video header is M0 bytes.
-            char* header = new char[HEADER_SIZE];
-
-            // @remark for test, each group contains N (header+video)s.
-            char** group = new char*[2 * NB_VIDEOS_IN_GROUP];
-            for (int i = 0; i < 2 * NB_VIDEOS_IN_GROUP; i+= 2) {
-                group[i] = header;
-                group[i + 1] = video;
-            }
-
+        while (exit_signal == 0) {
             // sendout the video group.
-            int sent = srs_send(client, group, use_writev, write_one_by_one);
-            delete[] video;
-            delete[] group;
-            delete[] header;
+            int sent = srs_send(client, group, use_writev, write_one_by_one, buf);
             if (sent == -1) {
                 printf("sendout the video group failed, client closed?\n");
-                ::close(client);
+                exit_signal = 1;
                 break;
             }
         }
+        ::close(client);
     }
+    if (exit_signal > 0) {
+        printf("\nexit by signal.\n");
+    }
+    ::close(fd);
+    delete[] buf;
+    delete[] video;
+    delete[] group;
+    delete[] header;
 
     return 0;
 }
@@ -116,7 +147,7 @@ int main(int argc, char** argv)
 // each group contains N (header+video)s.
 //      header is M bytes.
 //      videos is M0 bytes.
-int srs_send(int fd, char** group, bool use_writev, bool write_one_by_one)
+int srs_send(int fd, char** group, bool use_writev, bool write_one_by_one, char* buf)
 {
     if (use_writev) {
         iovec iovs[2 * NB_VIDEOS_IN_GROUP];
@@ -147,8 +178,7 @@ int srs_send(int fd, char** group, bool use_writev, bool write_one_by_one)
     }
 
     // use write, to avoid lots of syscall, we copy to a big buffer.
-    char* buf = new char[NB_VIDEOS_IN_GROUP * (HEADER_SIZE + VIDEO_SIZE)];
-
+ 
     int nn = 0;
     for (int i = 0; i < 2 * NB_VIDEOS_IN_GROUP; i+=2) {
         memcpy(buf + nn, group[i], HEADER_SIZE);
@@ -159,6 +189,6 @@ int srs_send(int fd, char** group, bool use_writev, bool write_one_by_one)
     }
 
     nn = ::write(fd, buf, nn);
-    delete[] buf;
+
     return nn;
 }

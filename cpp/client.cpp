@@ -4,6 +4,17 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <time.h>
+#include <signal.h>
+
+static volatile sig_atomic_t exit_signal = 0;
+
+void handle_sighup(int signum) 
+{
+    /* in case we registered this handler for multiple signals */ 
+    if (signum == SIGHUP || signum == SIGTERM || signum == SIGINT) {
+        exit_signal = 1;
+    }
+}
 
 int main(int argc, char** argv)
 {
@@ -34,19 +45,24 @@ int main(int argc, char** argv)
         printf("connect to server at tcp://%d failed.\n", port);
         exit(-1);
     }
-    printf("server at tcp://%d connected, stop server for bandwidth result.\n", port);
+    printf("server at tcp://%d connected, press <ctl+c> to exit ...\n", port);
+
+    /* you may also prefer sigaction() instead of signal() */
+    signal(SIGHUP, handle_sighup);
+    signal(SIGTERM, handle_sighup);
+    signal(SIGINT, handle_sighup);
 
     // read util EOF.
     // big buf size to reduce CPU usage of client
     // 64MB buffer
-    const int buffersize = 65535000;
+    const int buffersize = 65535;
     char *buf = (char*)malloc( buffersize*sizeof(char));
     int rd;
     int emptycount;
     int64_t readbytes;
     time_t start, end;
     time (&start);
-    while (true) {
+    while (exit_signal == 0) {
         rd = ::read(fd, buf, buffersize);
         if (rd == -1) {
             printf("server closed.\n");
@@ -62,9 +78,14 @@ int main(int argc, char** argv)
         }
         readbytes += rd;
     }
+    if (exit_signal > 0) {
+        printf("\nclient exit by signal.\n");
+    }
     time (&end);
     double dif = difftime (end, start);
-    printf ("Elasped time is %.2lf seconds, bandwidth %.2lf MB/s\n.", dif, readbytes / 1024 / 1024 / dif );
+    if (dif > 0) {
+        printf ("Elasped time is %.2lf seconds, bandwidth %.2lf MB/s.\n", dif, readbytes / 1024 / 1024 / dif );
+    }
 
     ::close(fd);
     free(buf);

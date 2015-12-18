@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
+	"sync/atomic"
+	"syscall"
 )
 
 const (
@@ -13,6 +16,16 @@ const (
 	VideoSize       = 4096
 	HeaderSize      = 12
 )
+
+var exit_signal int64 = 0
+
+// sigHandle
+func sigHandle(sigChan, exitChan chan os.Signal) {
+	sig := <-sigChan
+	fmt.Println("\nsignal catched:", sig)
+	atomic.AddInt64(&exit_signal, 1)
+	exitChan <- sig
+}
 
 func main() {
 	var err error
@@ -64,9 +77,31 @@ func main() {
 	}
 	defer listener.Close()
 
-	for {
+	var sigChan = make(chan os.Signal, 128)
+	var exitChan = make(chan os.Signal, 128)
+	//
+	// incoming signals will be catched
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM)
+	go sigHandle(sigChan, exitChan)
+
+	go func() {
+		<-exitChan
+		listener.Close()
+		fmt.Println("listener closed.")
+	}()
+
+	for atomic.LoadInt64(&exit_signal) == 0 {
 		var conn *net.TCPConn
 		if conn, err = listener.AcceptTCP(); err != nil {
+			if atomic.LoadInt64(&exit_signal) > 0 {
+				fmt.Println("listener exit for", err)
+				break
+			} else {
+				panic(err)
+			}
+		}
+
+		if err := conn.SetLinger(0); err != nil {
 			panic(err)
 		}
 
@@ -80,40 +115,70 @@ func connHandle(c *net.TCPConn, useWritev, writeOneByOne bool) {
 
 	c.SetNoDelay(false)
 
+	// use write, to avoid lots of syscall, we copy to a big buffer.
+	buf := make([]byte, NbVideosInGroup*(HeaderSize+VideoSize))
+
+	// @remark for test, each video is M bytes.
+	video := make([]byte, VideoSize)
+
+	// @remark for test, each video header is M0 bytes.
+	header := make([]byte, HeaderSize)
+
+	// @remark for test, each group contains N (header+video)s.
+	group := make([][]byte, 2*NbVideosInGroup)
+
+	for i := 0; i < 2*NbVideosInGroup; i += 2 {
+		group[i] = header
+		group[i+1] = video
+	}
+
 	// assume there is a video stream, which contains infinite video packets,
 	// server must delivery all video packets to client.
 	// for high performance, we send a group of video(to avoid too many syscall),
 	// here we send 10 videos as a group.
-	for {
-		// @remark for test, each video is M bytes.
-		video := make([]byte, VideoSize)
+	for atomic.LoadInt64(&exit_signal) == 0 {
+		if useWritev {
+			// sendout the video group by writev
+			/*
+				golang version streaming server.
+				always use 1 cpu
+				listen at tcp://1985, use writev true
+				calling into writev: 1024
+				exited from writev: 1024
+				calling into writev: 1024
 
-		// @remark for test, each video header is M0 bytes.
-		header := make([]byte, HeaderSize)
+				Killed
+			*/
 
-		// @remark for test, each group contains N (header+video)s.
-		group := make([][]byte, 2*NbVideosInGroup)
-		for i := 0; i < 2*NbVideosInGroup; i += 2 {
-			group[i] = header
-			group[i+1] = video
+			// BUG: Writev never return
+			for i := 0; i < 2*NbVideosInGroup; i += 2 {
+				group[i] = header
+				group[i+1] = video
+			}
+			fmt.Println("calling into writev:", len(group))
+			if _, err := c.Writev(group); err != nil {
+				fmt.Println("failed:", err)
+				return
+			}
+			fmt.Println("exited from writev:", len(group))
+			continue
 		}
-
 		// sendout the video group.
-		if err := srs_send(c, group, useWritev, writeOneByOne); err != nil {
-			fmt.Println("send failed:", err)
+		if err := srs_send(c, group, writeOneByOne, buf); err != nil {
+			fmt.Println("failed:", err)
 			return
 		}
 	}
+	if atomic.LoadInt64(&exit_signal) > 0 {
+		fmt.Println("connHandle exit for exit_signal ", atomic.LoadInt64(&exit_signal))
+	}
+	return
 }
 
 // each group contains N (header+video)s.
 //      header is M bytes.
 //      videos is M0 bytes.
-func srs_send(conn *net.TCPConn, group [][]byte, useWritev, writeOneByOne bool) (err error) {
-	if useWritev {
-		_, err = conn.Writev(group)
-		return
-	}
+func srs_send(conn *net.TCPConn, group [][]byte, writeOneByOne bool, buf []byte) (err error) {
 
 	// use write, send one by one packet.
 	// @remark avoid memory copy, but with lots of syscall, hurts performance.
@@ -125,9 +190,6 @@ func srs_send(conn *net.TCPConn, group [][]byte, useWritev, writeOneByOne bool) 
 		}
 		return
 	}
-
-	// use write, to avoid lots of syscall, we copy to a big buffer.
-	buf := make([]byte, NbVideosInGroup*(HeaderSize+VideoSize))
 
 	var nn int
 	for i := 0; i < 2*NbVideosInGroup; i++ {
